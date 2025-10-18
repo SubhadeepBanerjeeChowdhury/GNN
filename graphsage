@@ -1,0 +1,259 @@
+# ======== Import libraries ========
+import torch
+import torch.nn.functional as F
+from torch_geometric.data import HeteroData         # to handle heterogeneous graphs
+from torch_geometric.nn import SAGEConv             # GraphSAGE layer
+from torch_geometric.loader import LinkNeighborLoader
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
+
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+def load_data(dev_path, oot_path):
+    # Read dev and oot CSVs into pandas dataframes
+    dev = pd.read_csv(dev_path)
+    oot = pd.read_csv(oot_path)
+    print(f"Dev: {len(dev):,} rows | OOT: {len(oot):,} rows")
+    return dev, oot
+
+
+# ============================================================
+# 2. ENCODE CUSTOMER AND OFFER IDs INTO NUMERIC INDICES
+# ============================================================
+def encode_ids(df_train, df_test):
+    # Create integer IDs for card members and offers
+    cm_encoder = {k: i for i, k in enumerate(df_train['cust_xref_id'].unique())}
+    offer_encoder = {k: i for i, k in enumerate(df_train['offer_id'].unique())}
+
+    # Add integer columns for easier indexing
+    df_train['cm_id'] = df_train['cust_xref_id'].map(cm_encoder)
+    df_train['offer_id_enc'] = df_train['offer_id'].map(offer_encoder)
+
+    # For unseen IDs in OOT, give temporary new IDs
+    max_cm = len(cm_encoder)
+    max_offer = len(offer_encoder)
+    df_test['cm_id'] = df_test['cust_xref_id'].map(lambda x: cm_encoder.get(x, max_cm + hash(x) % 10000))
+    df_test['offer_id_enc'] = df_test['offer_id'].map(lambda x: offer_encoder.get(x, max_offer + hash(x) % 1000))
+
+    return df_train, df_test, cm_encoder, offer_encoder
+
+
+# ============================================================
+# 3. BUILD THE GRAPH OBJECT (PyTorch Geometric HeteroData)
+# ============================================================
+def build_hetero_graph(df):
+    # Initialize a heterogeneous graph: two node types — cm and offer
+    data = HeteroData()
+
+    # Average numeric features per cm and per offer to form simple node features
+    cm_features = df.groupby('cm_id').mean(numeric_only=True)
+    offer_features = df.groupby('offer_id_enc').mean(numeric_only=True)
+
+    # Assign node features (these can later be replaced by better features)
+    data['cm'].x = torch.tensor(cm_features.values, dtype=torch.float)
+    data['offer'].x = torch.tensor(offer_features.values, dtype=torch.float)
+
+    # Create edge list: which cm saw which offer
+    edge_index = torch.tensor(df[['cm_id', 'offer_id_enc']].values.T, dtype=torch.long)
+
+    # Edge features are the 123 impression-level features
+    edge_attr = torch.tensor(
+        df.drop(columns=['cust_xref_id', 'offer_id', 'imp_ts', 'label', 'cm_id', 'offer_id_enc']).values,
+        dtype=torch.float
+    )
+
+    # The label (1 = redeemed, 0 = not redeemed)
+    edge_label = torch.tensor(df['label'].values, dtype=torch.float)
+
+    # Add this information to the graph
+    data['cm', 'views', 'offer'].edge_index = edge_index
+    data['cm', 'views', 'offer'].edge_attr = edge_attr
+    data['cm', 'views', 'offer'].edge_label = edge_label
+
+    return data
+
+
+# ============================================================
+# 4. DEFINE MODEL FUNCTIONS (NO CLASSES, PURE FUNCTIONS)
+# ============================================================
+def build_layers(in_dim, hidden_dim):
+    # Build two GraphSAGE layers that will learn from neighboring nodes
+    return torch.nn.ModuleList([
+        SAGEConv(in_dim, hidden_dim),
+        SAGEConv(hidden_dim, hidden_dim)
+    ])
+
+def forward_pass(x_dict, edge_index_dict, edge_attr, layers, edge_mlp):
+    # Extract CM and offer node feature matrices
+    x_cm, x_offer = x_dict['cm'], x_dict['offer']
+
+    # Pass node features through two GraphSAGE layers
+    for layer in layers:
+        x_cm = F.relu(layer(x_cm, edge_index_dict[('cm', 'views', 'offer')]))           # CM -> Offer
+        x_offer = F.relu(layer(x_offer, edge_index_dict[('cm', 'views', 'offer')].flip(0)))  # Offer -> CM
+
+    # Combine them back into a dictionary
+    x_dict = {'cm': x_cm, 'offer': x_offer}
+
+    # For each edge (impression), get embeddings of its CM and Offer nodes
+    src, dst = edge_index_dict[('cm', 'views', 'offer')]
+    cm_emb = x_dict['cm'][src]
+    offer_emb = x_dict['offer'][dst]
+
+    # Concatenate both embeddings + the edge features
+    e_emb = torch.cat([cm_emb, offer_emb, edge_attr], dim=1)
+
+    # Pass this through an MLP to predict a single score (logit)
+    return edge_mlp(e_emb).squeeze()
+
+def create_model(in_dim, hidden_dim):
+    # Create two GNN layers + a simple feedforward MLP for prediction
+    layers = build_layers(in_dim, hidden_dim)
+    edge_mlp = torch.nn.Sequential(
+        torch.nn.Linear(2 * hidden_dim + in_dim, hidden_dim),
+        torch.nn.ReLU(),
+        torch.nn.Linear(hidden_dim, 1)
+    )
+    return layers, edge_mlp
+
+
+# ============================================================
+# 5. TRAINING FUNCTION
+# ============================================================
+def train_model(data, layers, edge_mlp, epochs=3, lr=1e-3, batch_size=2048):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    layers, edge_mlp = layers.to(device), edge_mlp.to(device)
+    data = data.to(device)
+
+    # Use Adam optimizer
+    opt = torch.optim.Adam(list(layers.parameters()) + list(edge_mlp.parameters()), lr=lr)
+
+    # DataLoader that samples edges in mini-batches (since we have millions of edges)
+    loader = LinkNeighborLoader(
+        data,
+        edge_label_index=(('cm', 'views', 'offer'), data['cm', 'views', 'offer'].edge_index),
+        edge_label=data['cm', 'views', 'offer'].edge_label,
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    # Training loop
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            batch = batch.to(device)
+
+            # Forward pass
+            logits = forward_pass(
+                batch.x_dict, batch.edge_index_dict,
+                batch['cm', 'views', 'offer'].edge_attr,
+                layers, edge_mlp
+            )
+
+            # Compute loss using binary cross entropy
+            labels = batch['cm', 'views', 'offer'].edge_label
+            loss = F.binary_cross_entropy_with_logits(logits, labels)
+
+            # Backpropagation
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1} | Average Loss: {total_loss/len(loader):.4f}")
+
+    return layers, edge_mlp
+
+
+# ============================================================
+# 6. SCORING FUNCTION (GET PREDICTION PROBABILITIES)
+# ============================================================
+def score_edges(df, cm_encoder, offer_encoder, layers, edge_mlp):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Convert CM and Offer IDs to their numeric IDs (drop unknowns)
+    df['cm_id'] = df['cust_xref_id'].map(lambda x: cm_encoder.get(x, -1))
+    df['offer_id_enc'] = df['offer_id'].map(lambda x: offer_encoder.get(x, -1))
+    df = df[(df['cm_id'] != -1) & (df['offer_id_enc'] != -1)]
+
+    # No full graph during inference — use precomputed embeddings or dummy ones
+    with torch.no_grad():
+        x_cm = torch.randn(len(cm_encoder), 64, device=device)
+        x_offer = torch.randn(len(offer_encoder), 64, device=device)
+        x_dict = {'cm': x_cm, 'offer': x_offer}
+        edge_index_dict = {
+            ('cm', 'views', 'offer'): torch.tensor(
+                df[['cm_id', 'offer_id_enc']].values.T,
+                dtype=torch.long, device=device)
+        }
+
+        edge_attr = torch.tensor(
+            df.drop(columns=['cust_xref_id', 'offer_id', 'imp_ts', 'label', 'cm_id', 'offer_id_enc']).values,
+            dtype=torch.float, device=device
+        )
+
+        # Get logits and convert to probabilities
+        logits = forward_pass(x_dict, edge_index_dict, edge_attr, layers, edge_mlp)
+        probs = torch.sigmoid(logits).cpu().numpy()
+
+    df['pred'] = probs
+    return df
+
+
+# ============================================================
+# 7. EVALUATION FUNCTION
+# ============================================================
+def evaluate(df):
+    y_true, y_pred = df['label'], df['pred']
+
+    # Classification metrics
+    auc = roc_auc_score(y_true, y_pred)
+    gini = 2 * auc - 1
+
+    # Quick top-K precision check (overall, not per CM)
+    def precision_at_k(k):
+        return (df.sort_values('pred', ascending=False).head(k)['label'].mean())
+
+    print(f"AUC: {auc:.4f} | GINI: {gini:.4f}")
+    print("Precision@7:", precision_at_k(7))
+    print("Precision@10:", precision_at_k(10))
+    print("Precision@20:", precision_at_k(20))
+
+
+# ============================================================
+# 8. MAIN EXECUTION PIPELINE
+# ============================================================
+def main():
+    # Step 1: Load dev and oot data
+    dev, oot = load_data("dev.csv", "oot.csv")
+
+    # Step 2: Encode IDs into numeric integers
+    dev, oot, cm_enc, offer_enc = encode_ids(dev, oot)
+
+    # Step 3: Convert dev data into a heterogeneous graph
+    data = build_hetero_graph(dev)
+
+    # Step 4: Create GNN layers + edge MLP model
+    in_dim = data['cm', 'views', 'offer'].edge_attr.shape[1]   # number of input features (123)
+    hidden_dim = 64                                            # size of hidden layer
+
+    layers, edge_mlp = create_model(in_dim, hidden_dim)
+
+    # Step 5: Train the model
+    layers, edge_mlp = train_model(data, layers, edge_mlp, epochs=5)
+
+    # Step 6: Score OOT data (out-of-time)
+    oot_scored = score_edges(oot, cm_enc, offer_enc, layers, edge_mlp)
+
+    # Step 7: Evaluate model performance
+    evaluate(oot_scored)
+
+
+# Run the pipeline
+if __name__ == "__main__":
+    main()
