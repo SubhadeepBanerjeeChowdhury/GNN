@@ -1,0 +1,69 @@
+✅ Step-by-step Fix
+
+Let's make sure the graph is correctly structured before passing it to the loader.
+
+Update your build_hetero_graph() function to add the reverse edge and verify indices.
+
+Replace your existing function with this:
+def build_hetero_graph(df):
+    data = HeteroData()
+
+    # --- 1. Create node features ---
+    cm_features = df.groupby('cm_id').mean(numeric_only=True)
+    offer_features = df.groupby('offer_id_enc').mean(numeric_only=True)
+
+    data['cm'].x = torch.tensor(cm_features.values, dtype=torch.float)
+    data['offer'].x = torch.tensor(offer_features.values, dtype=torch.float)
+
+    # --- 2. Create edges ---
+    edge_index = torch.tensor(df[['cm_id', 'offer_id_enc']].values.T, dtype=torch.long)
+    edge_attr = torch.tensor(
+        df.drop(columns=['cust_xref_id', 'offer_id', 'imp_ts', 'label', 'cm_id', 'offer_id_enc']).values,
+        dtype=torch.float
+    )
+    edge_label = torch.tensor(df['label'].values, dtype=torch.float)
+
+    # --- 3. Add edges in both directions ---
+    data['cm', 'views', 'offer'].edge_index = edge_index
+    data['cm', 'views', 'offer'].edge_attr = edge_attr
+    data['cm', 'views', 'offer'].edge_label = edge_label
+
+    # Add reverse edge type for message passing
+    data['offer', 'rev_views', 'cm'].edge_index = edge_index.flip(0)
+
+    return data
+
+✅ Second fix — update LinkNeighborLoader call
+
+Change your loader definition to specify both edge types:
+
+loader = LinkNeighborLoader(
+    data,
+    num_neighbors=[10, 5],
+    edge_label_index=(('cm', 'views', 'offer'), data['cm', 'views', 'offer'].edge_index),
+    edge_label=data['cm', 'views', 'offer'].edge_label,
+    batch_size=batch_size,
+    shuffle=True
+)
+
+
+This will now correctly sample neighbors for both directions (cm → offer and offer → cm) when training.
+
+✅ Debug tip
+
+If you still get the same AssertionError, add this before training:
+
+print(data)
+
+
+You should see something like:
+
+HeteroData(
+  cm={ x=[N_cm, d1] },
+  offer={ x=[N_offer, d2] },
+  (cm, views, offer)={ edge_index=[2, M] },
+  (offer, rev_views, cm)={ edge_index=[2, M] }
+)
+
+
+If any of these are missing or have mismatched shapes (e.g., edge index points beyond node count), that’s the root cause.
