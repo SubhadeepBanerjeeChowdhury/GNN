@@ -1,0 +1,242 @@
+# === basics / imports ===
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score, log_loss
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
+
+# torch_geometric imports
+try:
+    import torch_geometric
+    from torch_geometric.data import Data
+    from torch_geometric.loader import LinkNeighborLoader
+    from torch_geometric.nn import SAGEConv, global_mean_pool
+    from torch_geometric.utils import to_undirected
+except Exception as e:
+    raise ImportError("torch_geometric not found or failed to import. Install it (see README). Error: " + str(e))
+
+# === USER-SPECIFIC feature lists (you said you have them) ===
+# replace with your actual lists
+member_features = ["mfeat1","mfeat2","mfeat3","mfeat4","mfeat5","mfeat6","mfeat7","mfeat8","mfeat9","mfeat10"]
+offer_features  = ["ofeat1","ofeat2","ofeat3","ofeat4","ofeat5","ofeat6","ofeat7","ofeat8","ofeat9","ofeat10"]
+
+# === 1) load CSV & basic preprocessing ===
+def load_data(csv_path, sample_frac=None, random_state=42):
+    """
+    Load CSV. Expect columns: cust_xref_id, offer_id, depnt_var (0/1), and features in member_features & offer_features.
+    sample_frac: if provided, randomly sample fraction to speed up debugging (e.g., 0.1)
+    """
+    df = pd.read_csv(csv_path)
+    if sample_frac is not None:
+        df = df.sample(frac=sample_frac, random_state=random_state).reset_index(drop=True)
+    # Ensure depnt_var is int {0,1}
+    df['depnt_var'] = df['depnt_var'].astype(int)
+    return df
+
+# === 2) build bipartite graph mapping (node indexing) ===
+def build_bipartite_mappings(df, member_col='cust_xref_id', offer_col='offer_id'):
+    """
+    Map each unique member and offer to integer node ids.
+    We'll place members first [0..n_members-1], then offers [n_members..n_members+n_offers-1].
+    Return mappings and counts.
+    """
+    members = df[member_col].astype(str).unique()
+    offers = df[offer_col].astype(str).unique()
+
+    member2idx = {m: i for i, m in enumerate(members)}
+    offer2idx = {o: i + len(members) for i, o in enumerate(offers)}  # shift offers by n_members
+
+    n_members = len(members)
+    n_offers = len(offers)
+    return member2idx, offer2idx, n_members, n_offers
+
+# === 3) build PyG Data (graph + node features + edge labels) ===
+def build_pyg_graph(df, member2idx, offer2idx, n_members, n_offers,
+                    member_features, offer_features,
+                    member_col='cust_xref_id', offer_col='offer_id', label_col='depnt_var'):
+    """
+    Build a PyG Data object representing the bipartite graph.
+    Node features:
+      - member nodes: the member_features (rows repeated mapped to members)
+      - offer nodes: the offer_features
+    Edge index:
+      - for each impression row, create an undirected edge between member_node and offer_node.
+    Edge labels:
+      - per-edge label = depnt_var (0/1)
+    Note: For memory reasons we will not deduplicate multiple impressions between same member-offer pair;
+    we keep each impression as a distinct edge (PyG supports multiple parallel edges).
+    """
+    # Build edge lists (source = member idx, target = offer idx)
+    src = df[member_col].astype(str).map(member2idx).to_numpy(dtype=np.int64)
+    dst = df[offer_col].astype(str).map(offer2idx).to_numpy(dtype=np.int64)
+
+    edge_index = np.vstack([src, dst])
+    # make undirected (common for GNN to propagate both ways). For link loaders we may still pass directed edges
+    edge_index_und = to_undirected(torch.tensor(edge_index, dtype=torch.long))
+    edge_index_und = edge_index_und.long()
+
+    # Node features:
+    # For members: we'll compute per-member aggregated features by taking mean of rows for each member
+    # Similarly for offers. This reduces memory and gives node-level features.
+    # If you prefer precomputed member-level features separately, replace this aggregation step.
+
+    # Aggregate member features
+    member_feat_df = df[[member_col] + member_features].copy()
+    member_feat_df[member_col] = member_feat_df[member_col].astype(str)
+    member_agg = member_feat_df.groupby(member_col).mean().reindex(index=[str(k) for k in sorted(member2idx, key=lambda x: member2idx[x])])
+    # Ensure shape: (n_members, len(member_features))
+    member_X = torch.tensor(member_agg.values, dtype=torch.float)
+
+    # Aggregate offer features
+    offer_feat_df = df[[offer_col] + offer_features].copy()
+    offer_feat_df[offer_col] = offer_feat_df[offer_col].astype(str)
+    offer_agg = offer_feat_df.groupby(offer_col).mean().reindex(index=[str(k) for k in sorted(offer2idx, key=lambda x: offer2idx[x])])
+    offer_X = torch.tensor(offer_agg.values, dtype=torch.float)
+
+    # Concatenate node features: members then offers
+    x = torch.cat([member_X, offer_X], dim=0)  # (n_members + n_offers, feat_dim_member/offer) -- they must match dims
+    # If member and offer features lengths differ, we must pad the smaller one to same dim:
+    if member_X.shape[1] != offer_X.shape[1]:
+        # pad the smaller with zeros
+        maxd = max(member_X.shape[1], offer_X.shape[1])
+        def pad(t, target_dim):
+            if t.shape[1] < target_dim:
+                pad_cols = torch.zeros((t.shape[0], target_dim - t.shape[1]), dtype=t.dtype)
+                return torch.cat([t, pad_cols], dim=1)
+            return t
+        member_X = pad(member_X, maxd)
+        offer_X = pad(offer_X, maxd)
+        x = torch.cat([member_X, offer_X], dim=0)
+
+    # Edge-level labels: we need to keep the label per edge in the original order for LinkNeighborLoader
+    edge_label = torch.tensor(df[label_col].to_numpy(dtype=np.float32), dtype=torch.float32)
+
+    # Build Data object. We'll also attach edge_index in the original impression order as 'edge_index_orig'
+    data = Data(x=x, edge_index=edge_index_und)
+    # Important: also store the positive edge pairs in the order of impressions for link loader.
+    data['pos_edge_index'] = torch.tensor(np.vstack([src, dst]), dtype=torch.long)  # shape [2, num_impressions]
+    data['edge_label'] = edge_label  # aligned with pos_edge_index columns
+
+    # store sizes
+    data.n_members = n_members
+    data.n_offers = n_offers
+    return data
+
+# === 4) create train/val/test splits for edges ===
+def split_edges(df, test_size=0.1, val_size=0.1, random_state=42, time_col=None):
+    """
+    Split by rows (impressions). If you have a timestamp (time_col), prefer time-based split (train earlier, test later).
+    If time_col is None, do stratified random split by label to keep class balance.
+    Returns: train_idx, val_idx, test_idx (arrays of integer indices into df)
+    """
+    idx = np.arange(len(df))
+    if time_col is not None and time_col in df.columns:
+        # Time-based: sort by time and take last chunks as val/test
+        df_sorted = df.sort_values(by=time_col).reset_index(drop=True)
+        n = len(df_sorted)
+        test_cut = int(n * (1 - test_size))
+        val_cut = int(n * (1 - test_size - val_size))
+        train_idx = df_sorted.index[:val_cut].to_numpy()
+        val_idx = df_sorted.index[val_cut:test_cut].to_numpy()
+        test_idx = df_sorted.index[test_cut:].to_numpy()
+    else:
+        # random stratified split
+        train_idx, temp_idx = train_test_split(idx, test_size=(test_size + val_size), random_state=random_state,
+                                               stratify=df['depnt_var'])
+        val_rel = val_size / (test_size + val_size)
+        val_idx, test_idx = train_test_split(temp_idx, test_size=val_rel, random_state=random_state,
+                                             stratify=df.iloc[temp_idx]['depnt_var'])
+    return train_idx, val_idx, test_idx
+
+# === 5) build LinkNeighborLoader dataloaders (mini-batch edge sampling) ===
+def build_link_loaders(data, df, train_idx, val_idx, test_idx,
+                       num_neighbors=[10, 10], batch_size=4096, num_workers=4):
+    """
+    Build LinkNeighborLoader for train/val/test.
+    data: PyG Data with x and edge_index and pos_edge_index and edge_label
+    train_idx etc: indices into the dataframe (edge columns)
+    num_neighbors: neighbors sampled per GNN layer
+    """
+    # Create index masks for positive edges
+    # For LinkNeighborLoader, we supply a dict with 'edge_label_index' and optionally 'edge_label'
+    # We'll create Data objects for train/val/test using the pos_edge_index columns subset.
+    train_pos = data['pos_edge_index'][:, train_idx]
+    val_pos = data['pos_edge_index'][:, val_idx]
+    test_pos = data['pos_edge_index'][:, test_idx]
+
+    train_edge_label = data['edge_label'][train_idx]
+    val_edge_label = data['edge_label'][val_idx]
+    test_edge_label = data['edge_label'][test_idx]
+
+    # Build loaders
+    train_loader = LinkNeighborLoader(data,
+                                      num_neighbors=num_neighbors,
+                                      batch_size=batch_size,
+                                      edge_label_index=train_pos,
+                                      edge_label=train_edge_label,
+                                      shuffle=True,
+                                      num_workers=num_workers)
+    val_loader = LinkNeighborLoader(data,
+                                    num_neighbors=num_neighbors,
+                                    batch_size=batch_size,
+                                    edge_label_index=val_pos,
+                                    edge_label=val_edge_label,
+                                    shuffle=False,
+                                    num_workers=num_workers)
+    test_loader = LinkNeighborLoader(data,
+                                     num_neighbors=num_neighbors,
+                                     batch_size=batch_size,
+                                     edge_label_index=test_pos,
+                                     edge_label=test_edge_label,
+                                     shuffle=False,
+                                     num_workers=num_workers)
+    return train_loader, val_loader, test_loader
+
+# === 6) model: GNN encoder (GraphSAGE) + edge predictor MLP ===
+def build_model(in_channels, hidden_channels=64, num_layers=2, dropout=0.2):
+    """
+    Returns two nn.Modules:
+      - encoder(node features -> node embeddings) using SAGEConv
+      - edge_mlp( concat(u_emb, v_emb) -> probability )
+    Both are returned as simple nn.Modules (callable).
+    """
+    class Encoder(nn.Module):
+        def __init__(self, in_channels, hidden_channels, num_layers, dropout):
+            super().__init__()
+            self.convs = nn.ModuleList()
+            if num_layers == 1:
+                self.convs.append(SAGEConv(in_channels, hidden_channels))
+            else:
+                self.convs.append(SAGEConv(in_channels, hidden_channels))
+                for _ in range(num_layers-1):
+                    self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+            self.dropout = dropout
+
+        def forward(self, x, edge_index):
+            for conv in self.convs:
+                x = conv(x, edge_index)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+            return x
+
+    class EdgeMLP(nn.Module):
+        def __init__(self, emb_dim, hidden=64):
+            super().__init__()
+            self.mlp = nn.Sequential(
+                nn.Linear(emb_dim * 2, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 1)
+            )
+        def forward(self, u_emb, v_emb):
+            z = torch.cat([u_emb, v_emb], dim=-1)
+            return torch.sigmoid(self.mlp(z)).view(-1)
+
+    encoder = Encoder(in_channels, hidden_channels, num_layers, dropout)
+    edge_mlp = EdgeMLP(hidden_channels, hidden=hidden_channels)
+    return encoder, edge_mlp
+
+# === 7) training loop (one epoch function) ===
+def
