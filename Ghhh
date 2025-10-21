@@ -1,0 +1,20 @@
+# --- REVISED TENSOR CONVERSION (Step 2 in the final approach) ---
+
+# 1. Prepare the indices array required by tf.SparseTensor
+# tf.SparseTensor expects indices in shape: [[r1, c1], [r2, c2], ...]
+# We stack the row and column arrays together.
+indices = np.vstack((A_train.row, A_train.col)).T 
+
+# 2. Construct the tf.SparseTensor
+A_train_tensor = tf.SparseTensor(
+    indices=indices, 
+    values=A_train.data, 
+    dense_shape=A_train.shape
+)
+
+# 3. Convert remaining data
+X_tensor = tf.convert_to_tensor(X, dtype=tf.float32)
+
+# NOTE: y_train_idx/y_test_idx tensor creation logic remains the same
+y_train_idx_tensor = (tf.constant(y_train_idx[0]), tf.constant(y_train_idx[1]))
+y_test_idx_tensor = (tf.constant(y_test_idx[0]), tf.constant(y_test_idx[1]))
