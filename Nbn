@@ -1,0 +1,50 @@
+# --- Previous Creation ---
+# A_train = csr_matrix((np.ones(len(train_df), dtype=np.float32),
+#                       (train_df['src'].values, train_df['dst'].values)),
+#                      shape=(n_nodes, n_nodes))
+# A_train = A_train + A_train.T 
+# -------------------------
+
+# --- NEW SIMPLIFIED COO CREATION ---
+# 1. Get the edge data for training impressions
+train_src = train_df['src'].values
+train_dst = train_df['dst'].values
+train_data = np.ones(len(train_train_df), dtype=np.float32) # Data (all 1s for unweighted)
+
+# 2. Create the initial forward (CM -> Offer) adjacency matrix in COO format
+A_forward = csr_matrix((train_data, (train_src, train_dst)),
+                       shape=(n_nodes, n_nodes)).tocoo()
+
+# 3. Create the reverse (Offer -> CM) adjacency matrix
+A_reverse = csr_matrix((train_data, (train_dst, train_src)),
+                       shape=(n_nodes, n_nodes)).tocoo()
+
+# 4. Combine them to form the final symmetric matrix in COO format
+A_train = A_forward + A_reverse
+# Ensure it's still COO or CSR before tensor conversion
+A_train = A_train.tocoo() 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Convert sparse matrices and indices to tensors
+X_tensor = tf.convert_to_tensor(X, dtype=tf.float32)
+
+# Use the newly created A_train (which is now guaranteed to be COO format)
+A_train_tensor = AdjToSpTensor()(A_train) # Call the transform directly on the SciPy matrix
+
+# Ensure y_train_idx tensor creation is clean (this looked correct before)
+y_train_idx_tensor = (tf.constant(y_train_idx[0]), tf.constant(y_train_idx[1]))
+y_test_idx_tensor = (tf.constant(y_test_idx[0]), tf.constant(y_test_idx[1]))
