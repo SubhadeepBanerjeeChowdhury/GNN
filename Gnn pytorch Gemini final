@@ -1,0 +1,80 @@
+import pandas as pd
+import torch
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import SAGEConv, to_hetero, Linear, GATConv
+from torch.nn import BatchNorm1d, Dropout
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# --- 1. Define Feature Lists (Simulated) ---
+# Replace these with your actual feature column names
+member_features = [f'M_{i}' for i in range(1, 16)]
+offer_features = [f'O_{i}' for i in range(1, 16)]
+ALL_FEATURES = ['cust_xref_id', 'offer_id', 'depnt_var'] + member_features + offer_features
+
+# --- 2. Load and Preprocess Data (Simulated Loading 2.5M rows) ---
+# Replace this with your actual data loading
+print("Loading and Preprocessing Data...")
+try:
+    # Load your actual 2.5M row CSV file
+    df = pd.read_csv('your_2.5M_data.csv', usecols=ALL_FEATURES)
+except FileNotFoundError:
+    print("Simulating data for demonstration...")
+    # Simulation: Replace this block with your actual data loading
+    num_rows = 2500000 
+    num_cms = 111000
+    num_offers = 580
+    
+    # Create dummy data
+    data = {
+        'cust_xref_id': pd.Series([f'CM_{i}' for i in range(num_cms)]).sample(num_rows, replace=True).values,
+        'offer_id': pd.Series([f'O_{i}' for i in range(num_offers)]).sample(num_rows, replace=True).values,
+        'depnt_var': torch.randint(0, 2, (num_rows,)).numpy(),
+    }
+    for feature in member_features + offer_features:
+        data[feature] = torch.rand(num_rows).numpy()
+    df = pd.DataFrame(data)
+    # End of Simulation
+
+# Map IDs to consecutive integers for PyG
+cm_mapping = {id: i for i, id in enumerate(df['cust_xref_id'].unique())}
+offer_mapping = {id: i for i, id in enumerate(df['offer_id'].unique())}
+df['cm_idx'] = df['cust_xref_id'].map(cm_mapping)
+df['offer_idx'] = df['offer_id'].map(offer_mapping)
+
+# Separate features
+cm_feature_df = df[['cm_idx'] + member_features].drop_duplicates().sort_values('cm_idx').set_index('cm_idx')
+offer_feature_df = df[['offer_idx'] + offer_features].drop_duplicates().sort_values('offer_idx').set_index('offer_idx')
+
+# Standardize numerical features
+scaler = StandardScaler()
+cm_features_scaled = scaler.fit_transform(cm_feature_df[member_features])
+offer_features_scaled = scaler.fit_transform(offer_feature_df[offer_features])
+
+# --- 3. Create PyG HeteroData Object ---
+data = HeteroData()
+
+# Node features: Convert scaled features to tensors
+data['cm'].x = torch.tensor(cm_features_scaled, dtype=torch.float)
+data['offer'].x = torch.tensor(offer_features_scaled, dtype=torch.float)
+
+# Edge index (Impressions)
+src = torch.tensor(df['cm_idx'].values)
+dst = torch.tensor(df['offer_idx'].values)
+data['cm', 'impress', 'offer'].edge_index = torch.stack([src, dst], dim=0)
+
+# Edge label (Redemption)
+data['cm', 'impress', 'offer'].edge_label = torch.tensor(df['depnt_var'].values, dtype=torch.float)
+
+print(data)
+# Example output:
+# HeteroData(
+#   cm={ x=[111000, 15] },
+#   offer={ x=[580, 15] },
+#   (cm, impress, offer)={
+#     edge_index=[2, 2500000],
+#     edge_label=[2500000]
+#   }
+# )
+print("HeteroData object created successfully.")
